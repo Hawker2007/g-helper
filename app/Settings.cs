@@ -60,6 +60,10 @@ namespace GHelper
 
         bool sliderGammaIgnore = false;
 
+        // desktops have no built-in screen / keyboard backlight / battery,
+        // their sections in the main form are just dead space
+        readonly bool desktop = AppConfig.IsDesktop();
+
         public SettingsForm()
         {
 
@@ -302,6 +306,13 @@ namespace GHelper
 
             labelBacklight.ForeColor = colorStandard;
             labelBacklight.Click += LabelBacklight_Click;
+
+            if (desktop)
+            {
+                panelScreen.Visible = false;
+                panelKeyboard.Visible = false;
+                panelBattery.Visible = false;
+            }
 
             panelPerformance.Focus();
             InitVisual();
@@ -1415,6 +1426,12 @@ namespace GHelper
 
         public void VisualiseScreen(bool screenEnabled, bool screenAuto, int frequency, int maxFrequency, int overdrive, bool overdriveSetting, int miniled1, int miniled2, bool hdr, bool acm, int fhd, int hdrControl)
         {
+            if (desktop)
+            {
+                panelScreen.Visible = false;
+                return;
+            }
+
             bool advancedColor = hdr || acm;
 
             ButtonEnabled(button60Hz, screenEnabled);
