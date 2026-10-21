@@ -230,6 +230,7 @@ namespace GHelper.Peripherals.Keyboard
         public void StartEventListener()
         {
             if (TestMode) return;
+            lastActivity = DateTime.UtcNow;
             events ??= new PeripheralEventListener(VendorID(), ProductID(), GetDisplayName(), OnEventReport);
             events.Start(path);
         }
@@ -239,8 +240,31 @@ namespace GHelper.Peripherals.Keyboard
             events?.Stop();
         }
 
+        private DateTime lastActivity;
+
         private void OnEventReport(byte[] buffer, int count)
         {
+            // first report after an idle gap. entering standby also emits one final report,
+            // so don't replay blindly: probe with the power query instead. the receiver answers
+            // FF-AA while the keyboard sleeps (ReadBattery keeps it pending) and real data once
+            // it is awake, which is when ReadBattery raises the replay itself
+            DateTime now = DateTime.UtcNow;
+            bool idle = (now - lastActivity).TotalSeconds > 10;
+            lastActivity = now;
+
+            if (idle)
+            {
+                if (!HasBattery() && !HasAutoPowerOff())
+                {
+                    Logger.WriteLine(GetDisplayName() + ": activity after idle, replaying lighting");
+                    KeyboardReadyChanged?.Invoke(this, EventArgs.Empty);
+                }
+                else
+                {
+                    Task.Run(() => { try { ReadBattery(); } catch { } });
+                }
+            }
+
             if (count < 5 || buffer[1] != EventReportId) return;
 
             int reported = 0;
@@ -284,7 +308,9 @@ namespace GHelper.Peripherals.Keyboard
         {
             bool notify = IsDeviceReady != ready;
             IsDeviceReady = ready;
-            if (notify) KeyboardReadyChanged?.Invoke(this, EventArgs.Empty);
+            if (!notify) return;
+            Logger.WriteLine(GetDisplayName() + $": Ready -> {ready} (battery {Battery}%, charging {Charging})");
+            KeyboardReadyChanged?.Invoke(this, EventArgs.Empty);
         }
 
         public virtual void SynchronizeDevice()
@@ -413,12 +439,31 @@ namespace GHelper.Peripherals.Keyboard
             return response[6];
         }
 
+        // set while the device answers nothing (receiver replies FF-AA on behalf of a
+        // keyboard in its own standby); the next good reply is the wake up edge
+        private bool _asleep;
+
+        // plugging or unplugging the charger makes the keyboard re-init its own lighting,
+        // so a change of the charging flag is another edge worth replaying our scheme on
+        private bool? _lastCharge;
+
         public void ReadBattery()
         {
             if (!HasBattery() && !HasAutoPowerOff()) return;
 
             byte[]? response = WriteForResponse(new byte[] { reportId, 0x12, 0x01 });
-            if (response is null) return;
+            if (response is null)
+            {
+                if (!_asleep)
+                {
+                    _asleep = true;
+                    Logger.WriteLine(GetDisplayName() + ": Keyboard standby");
+                }
+                return;
+            }
+
+            bool wake = _asleep;
+            _asleep = false;
 
             bool ok = response[1] == 0x12 && response[2] == 0x01;
 
@@ -440,8 +485,19 @@ namespace GHelper.Peripherals.Keyboard
                 BatteryUpdated?.Invoke(this, EventArgs.Empty);
             }
 
+            bool chargeEdge = ok && _lastCharge is not null && Charging != _lastCharge;
+            if (ok) _lastCharge = Charging;
+
             if (HasAutoPowerOff() && ok && (response[7] <= 4 || response[7] == 0xFF))
                 PowerOffSetting = (Mouse.PowerOffSetting)response[7];
+
+            // IsDeviceReady never drops during standby or a charger switch, so raise the
+            // ready event by hand: these are the only edges telling us the lighting may be gone
+            if (ok && (wake || chargeEdge))
+            {
+                Logger.WriteLine(GetDisplayName() + $": Keyboard awake after {(wake ? "standby" : "charger switch")}");
+                KeyboardReadyChanged?.Invoke(this, EventArgs.Empty);
+            }
         }
 
         public virtual KeyboardLightingMode[] SupportedLightingModes()
@@ -704,8 +760,14 @@ namespace GHelper.Peripherals.Keyboard
             byte[] packet = BuildAuraPacket(mode, color, color2, speed, brightness);
             byte[]? response = WriteForResponse(packet);
 
-            if (response is not null) Logger.WriteLine(GetDisplayName() + ": Lighting " + BitConverter.ToString(packet, 0, Math.Min(19, packet.Length)));
-            return response is not null;
+            if (response is null)
+            {
+                Logger.WriteLine(GetDisplayName() + $": Lighting {mode} not acknowledged");
+                return false;
+            }
+
+            Logger.WriteLine(GetDisplayName() + ": Lighting " + BitConverter.ToString(packet, 0, Math.Min(19, packet.Length)));
+            return true;
         }
 
         private int _streamingBusy;
@@ -904,9 +966,18 @@ namespace GHelper.Peripherals.Keyboard
 
         public bool ApplyStoredLighting()
         {
-            if (!HasStoredLighting) return false;
-            if (StoredMode == KeyboardLightingMode.Direct) return SetLedColors(StoredKeyColors());
-            return ApplyLighting(StoredMode, StoredColor, StoredColor2, StoredSpeed, StoredBrightness);
+            if (!HasStoredLighting)
+            {
+                Logger.WriteLine(GetDisplayName() + ": No stored lighting to restore");
+                return false;
+            }
+
+            bool ok = StoredMode == KeyboardLightingMode.Direct
+                ? SetLedColors(StoredKeyColors())
+                : ApplyLighting(StoredMode, StoredColor, StoredColor2, StoredSpeed, StoredBrightness);
+
+            Logger.WriteLine(GetDisplayName() + $": Restore lighting {StoredMode} -> {(ok ? "ok" : "failed")}");
+            return ok;
         }
 
         public bool HasTransientLighting => StoredMode == KeyboardLightingMode.Direct;

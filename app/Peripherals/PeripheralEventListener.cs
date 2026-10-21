@@ -10,7 +10,9 @@ namespace GHelper.Peripherals
         private readonly string name;
         private readonly Action<byte[], int> onReport;
 
+        private readonly HashSet<string> paths = new();
         private readonly List<HidStream> streams = new();
+        private bool stopped;
 
         public PeripheralEventListener(ushort vendorId, ushort productId, string name, Action<byte[], int> onReport)
         {
@@ -20,59 +22,89 @@ namespace GHelper.Peripherals
             this.onReport = onReport;
         }
 
+        // one reconnecting read loop per input collection; Start is safe to call again
+        // after a dongle re-plug to pick up collections that appeared in the meantime
         public void Start(string? commandPath)
         {
-            lock (streams)
+            stopped = false;
+
+            foreach (var device in DeviceList.Local.GetHidDevices(vendorId, productId))
             {
-                if (streams.Count > 0) return;
+                // mi_00 is the pointer collection and would report every mouse movement
+                if (device.DevicePath.Contains("mi_00")) continue;
+                if (commandPath is not null && device.DevicePath.Contains(commandPath)) continue;
 
-                foreach (var device in DeviceList.Local.GetHidDevices(vendorId, productId))
+                int size;
+                try { size = device.GetMaxInputReportLength(); }
+                catch { continue; }
+                if (size < 2) continue;
+
+                lock (paths)
                 {
-                    try
-                    {
-                        // mi_00 is the pointer collection and would report every mouse movement
-                        if (device.DevicePath.Contains("mi_00")) continue;
-                        if (commandPath is not null && device.DevicePath.Contains(commandPath)) continue;
-                        int size = device.GetMaxInputReportLength();
-                        if (size < 2) continue;
-
-                        var config = new OpenConfiguration();
-                        config.SetOption(OpenOption.Interruptible, true);
-                        config.SetOption(OpenOption.Exclusive, false);
-                        var opened = device.Open(config);
-                        opened.ReadTimeout = Timeout.Infinite;
-                        streams.Add(opened);
-                        Task.Run(() => Loop(opened, size));
-                    }
-                    catch { }
+                    if (!paths.Add(device.DevicePath)) continue;
                 }
 
-                Logger.WriteLine(name + ": listening for events on " + streams.Count + " interfaces");
+                Logger.WriteLine(name + $": event stream {device.DevicePath} (input {size})");
+                Task.Run(() => Loop(device, size));
             }
         }
 
         public void Stop()
         {
-            lock (streams)
+            stopped = true;
+            lock (paths)
             {
                 foreach (var opened in streams)
                 {
                     try { opened.Dispose(); } catch { }
                 }
                 streams.Clear();
+                paths.Clear();
             }
         }
 
-        private void Loop(HidStream opened, int size)
+        // a sleeping dongle drops its streams: reopen until the interface itself is gone,
+        // so the first report after wake is never missed while the app runs
+        private void Loop(HidDevice device, int size)
         {
             byte[] buffer = new byte[size];
-            while (true)
+
+            while (!stopped)
             {
-                int count;
-                try { count = opened.Read(buffer); }
-                catch { break; }
-                if (count > 0) try { onReport(buffer, count); } catch { }
+                HidStream? stream = null;
+                try
+                {
+                    var config = new OpenConfiguration();
+                    config.SetOption(OpenOption.Interruptible, true);
+                    config.SetOption(OpenOption.Exclusive, false);
+                    stream = device.Open(config);
+                    stream.ReadTimeout = Timeout.Infinite;
+
+                    lock (paths) { streams.Add(stream); }
+
+                    while (true)
+                    {
+                        int count = stream.Read(buffer);
+                        if (count > 0) try { onReport(buffer, count); } catch { }
+                    }
+                }
+                catch (Exception e)
+                {
+                    Logger.WriteLine(name + ": event stream closed - " + e.Message);
+                }
+                finally
+                {
+                    lock (paths) { streams.Remove(stream); }
+                    try { stream?.Dispose(); } catch { }
+                }
+
+                Thread.Sleep(500);
+                if (stopped) break;
+                if (!DeviceList.Local.GetHidDevices(vendorId, productId).Any(x => x.DevicePath == device.DevicePath)) break;
             }
+
+            lock (paths) { paths.Remove(device.DevicePath); }
+            Logger.WriteLine(name + ": event stream gone " + device.DevicePath);
         }
     }
 }

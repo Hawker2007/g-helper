@@ -177,6 +177,7 @@ namespace GHelper.Peripherals
             {
                 if (!m.IsDeviceReady)
                 {
+                    Logger.WriteLine(m.GetDisplayName() + ": not ready, synchronising");
                     //Try to sync the device if that hasn't been done yet
                     m.SynchronizeDevice();
                 }
@@ -271,14 +272,19 @@ namespace GHelper.Peripherals
                 return;
             }
 
+            // the OMNI receiver answers on its own while the keyboard behind it is still waking,
+            // so it needs a much longer grace window than a directly connected keyboard
+            int maxTries = kb.ProductID() == OMNI_PID ? 12 : 3;
             int tries = 0;
-            while (!kb.IsDeviceReady && tries < 3)
+            while (!kb.IsDeviceReady && tries < maxTries)
             {
                 Thread.Sleep(250);
                 Logger.WriteLine(kb.GetDisplayName() + " synchronising. Try " + (tries + 1));
                 kb.SynchronizeDevice();
                 ++tries;
             }
+
+            Logger.WriteLine(kb.GetDisplayName() + $": connect attempt done, ready={kb.IsDeviceReady} after {tries} synchronise tries");
 
             if (kb.ProductID() == OMNI_PID && !kb.IsDeviceReady)
             {
@@ -296,6 +302,7 @@ namespace GHelper.Peripherals
             kb.Disconnect += Keyboard_Disconnect;
             kb.KeyboardReadyChanged += PeripheralReadyChanged;
             kb.BatteryUpdated += BatteryUpdated;
+            kb.StartEventListener();
 
             if (DeviceChanged is not null)
             {
@@ -309,10 +316,25 @@ namespace GHelper.Peripherals
                 {
                     kb.ReadMultiLayout();
                     kb.ReadProfile();
-                    if (IsKeyboardAuraSync) kb.SyncFromLaptopAura();
-                    else if (kb.HasTransientLighting) kb.ApplyStoredLighting();
+                    if (IsKeyboardAuraSync)
+                    {
+                        Logger.WriteLine(kb.GetDisplayName() + ": applying laptop aura on connect");
+                        kb.SyncFromLaptopAura();
+                    }
+                    else if (kb.HasTransientLighting)
+                    {
+                        Logger.WriteLine(kb.GetDisplayName() + ": restoring stored lighting on connect");
+                        kb.ApplyStoredLighting();
+                    }
+                    else
+                    {
+                        Logger.WriteLine(kb.GetDisplayName() + ": lighting left to the device, nothing to replay");
+                    }
                 }
-                catch { }
+                catch (Exception e)
+                {
+                    Logger.WriteLine(kb.GetDisplayName() + ": post-connect init failed: " + e.Message);
+                }
             });
         }
 
@@ -412,11 +434,25 @@ namespace GHelper.Peripherals
         {
             UpdateSettingsView();
 
-            if (sender is AsusKeyboard kb && kb.IsDeviceReady && kb.HasTransientLighting
-                && !IsKeyboardAuraSync)
+            if (sender is not AsusKeyboard kb) return;
+
+            bool restore = kb.IsDeviceReady && kb.HasTransientLighting && !IsKeyboardAuraSync;
+            Logger.WriteLine(kb.GetDisplayName() + $": ready={kb.IsDeviceReady} transient={kb.HasTransientLighting} auraSync={IsKeyboardAuraSync} -> replay={(restore ? "stored lighting" : "nothing")}");
+
+            if (!restore) return;
+
+            // right after wake the vendor channel can still be coming up and the first
+            // write times out; one short retry covers it without any background polling
+            Task.Run(() =>
             {
-                Task.Run(() => { try { kb.ApplyStoredLighting(); } catch { } });
-            }
+                try
+                {
+                    if (kb.ApplyStoredLighting()) return;
+                    Thread.Sleep(1000);
+                    kb.ApplyStoredLighting();
+                }
+                catch { }
+            });
         }
 
         private static void ButtonBindingsChanged(object? sender, EventArgs e)
@@ -826,6 +862,7 @@ namespace GHelper.Peripherals
             DetectAllAsusMice();
             DetectAllAsusKeyboards();
             DetectAllAsusHeadsets();
+            Logger.WriteLine($"Peripherals after rescan: {ConnectedMice.Count} mice, {ConnectedKeyboards.Count} keyboards, {ConnectedHeadsets.Count} headsets");
             if (AppConfig.IsDetachableKeyboard()) Program.inputDispatcher.Init();
             XGM.Init();
         }

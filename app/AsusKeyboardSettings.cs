@@ -972,7 +972,7 @@ namespace GHelper
 
         private void AsusKeyboardSettings_FormClosing(object? sender, FormClosingEventArgs e)
         {
-            keyboard.StopEventListener();
+            // the event listener stays alive: it is the wake trigger for the lighting replay
             keyboard.ProfileChanged -= Keyboard_ProfileChanged;
             keyboard.BatteryUpdated -= Keyboard_BatteryUpdated;
             keyboard.Disconnect -= Keyboard_Disconnect;

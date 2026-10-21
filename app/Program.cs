@@ -405,11 +405,8 @@ namespace GHelper
             }
 
             PowerLineStatus status = SystemInformation.PowerStatus.PowerLineStatus;
-            if (status != lastLineStatus)
-            {
-                lastLineStatus = status;
-                Logger.WriteLine($"Power Mode {e.Mode}: {status}");
-            }
+            Logger.WriteLine($"Power Mode {e.Mode}: {status} (was {lastLineStatus})");
+            lastLineStatus = status;
 
             SchedulePowerCheck();
         }
